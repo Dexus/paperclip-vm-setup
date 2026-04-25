@@ -544,7 +544,10 @@ NET_BASE="${SERVER_NET%.*}"                  # e.g. 10.7.0
 SERVER_PUB="$(cat /etc/wireguard/server_public.key)"
 
 # --- Pick the lowest free IP in the subnet --------------------------------
-USED="$(grep -E '^AllowedIPs' "$CONF" | awk -F'= *' '{print $2}' \
+# Use awk (not grep) for the first stage: awk returns 0 even with no match,
+# so an empty wg0.conf (no peers yet) doesn't trip set -o pipefail and kill
+# the script silently before we ever append the first peer.
+USED="$(awk -F'= *' '/^AllowedIPs/ {print $2}' "$CONF" \
         | tr ',' '\n' | sed 's|/.*||' | awk -F. '{print $NF}' | sort -nu)"
 USED+=$'\n'"${SERVER_NET##*.}"   # exclude the server itself
 NEXT=""
