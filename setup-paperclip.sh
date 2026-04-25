@@ -165,6 +165,7 @@ apt-get update -y
 apt-get -y install \
   curl ca-certificates gnupg git build-essential unzip wget \
   ripgrep silversearcher-ag \
+  nano less htop \
   python3 python3-pip python3-venv \
   nginx
 
