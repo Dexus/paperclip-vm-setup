@@ -5,6 +5,7 @@
 #  What this does, in order:
 #    1. Creates the `paperclip` system user (idempotent).
 #    2. Installs system packages (curl, git, build-essential, nginx…).
+#    2.5 Installs GitHub CLI (gh) from the official cli.github.com apt repo.
 #    3. Installs Node.js 24 + pnpm (Paperclip needs Node 20+; Paperclip's own
 #       Dockerfile now uses Node 24, so we match that).
 #    4. (Firewall is no longer configured here — see harden-server.sh.)
@@ -91,9 +92,26 @@ log "Updating apt + installing base packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get -y install \
-  curl ca-certificates gnupg git build-essential unzip \
+  curl ca-certificates gnupg git build-essential unzip wget \
   python3 python3-pip python3-venv \
   nginx
+
+# ---------- 2.5 GitHub CLI (gh) -------------------------------------------
+# Official install path from https://github.com/cli/cli/blob/trunk/docs/install_linux.md#debian
+# Idempotent: re-fetches the keyring (cheap, single file) and only writes
+# the apt source if missing.
+log "Installing GitHub CLI (gh) from cli.github.com apt repo"
+install -d -m 0755 /etc/apt/keyrings
+GH_KEYRING=/etc/apt/keyrings/githubcli-archive-keyring.gpg
+wget -nv -O "$GH_KEYRING" https://cli.github.com/packages/githubcli-archive-keyring.gpg
+chmod go+r "$GH_KEYRING"
+GH_LIST=/etc/apt/sources.list.d/github-cli.list
+GH_LINE="deb [arch=$(dpkg --print-architecture) signed-by=${GH_KEYRING}] https://cli.github.com/packages stable main"
+if [[ ! -f "$GH_LIST" ]] || ! grep -qxF "$GH_LINE" "$GH_LIST"; then
+  printf '%s\n' "$GH_LINE" > "$GH_LIST"
+fi
+apt-get update -y
+apt-get -y install gh
 
 # ---------- 3. Node.js + pnpm ----------------------------------------------
 need_node=1
@@ -427,6 +445,7 @@ Next steps:
        claude              # signs in / sets ANTHROPIC_API_KEY
        codex               # 'Sign in with ChatGPT' or API key
        opencode auth login # pick provider, paste key
+       gh auth login       # GitHub CLI — device-flow login, optional
 
   2. Configure Paperclip itself:
        cd ~/paperclip
