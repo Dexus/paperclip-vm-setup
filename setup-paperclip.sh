@@ -4,10 +4,10 @@
 # ----------------------------------------------------------------------------
 #  What this does, in order:
 #    1. Creates the `paperclip` system user (idempotent).
-#    2. Installs system packages (curl, git, build-essential, nginx, ufw…).
+#    2. Installs system packages (curl, git, build-essential, nginx…).
 #    3. Installs Node.js 24 + pnpm (Paperclip needs Node 20+; Paperclip's own
 #       Dockerfile now uses Node 24, so we match that).
-#    4. (Optional) Configures UFW to allow SSH + 80 + 443.
+#    4. (Firewall is no longer configured here — see harden-server.sh.)
 #    5. Sets a per-user npm prefix for `paperclip` so `npm -g` works without
 #       sudo (Anthropic explicitly recommends against `sudo npm install -g`).
 #    6. Clones github.com/paperclipai/paperclip and runs pnpm install + build.
@@ -52,7 +52,6 @@ PAPERCLIP_REPO="${PAPERCLIP_REPO:-https://github.com/paperclipai/paperclip.git}"
 HERMES_ADAPTER_PKG="${HERMES_ADAPTER_PKG:-hermes-paperclip-adapter}"
 NODE_MAJOR="${NODE_MAJOR:-24}"
 GRANT_SUDO="${GRANT_SUDO:-0}"               # 1 = add paperclip to sudo group
-SETUP_FIREWALL="${SETUP_FIREWALL:-1}"       # 0 = skip ufw
 SETUP_NGINX="${SETUP_NGINX:-1}"             # 0 = skip nginx site
 SETUP_SYSTEMD="${SETUP_SYSTEMD:-1}"         # 0 = skip systemd unit
 PAPERCLIP_START_CMD="${PAPERCLIP_START_CMD:-pnpm dev:once}"
@@ -94,7 +93,7 @@ apt-get update -y
 apt-get -y install \
   curl ca-certificates gnupg git build-essential unzip \
   python3 python3-pip python3-venv \
-  nginx ufw
+  nginx
 
 # ---------- 3. Node.js + pnpm ----------------------------------------------
 need_node=1
@@ -115,15 +114,9 @@ log "Installing pnpm globally"
 npm install -g 'pnpm@>=9.15'
 node -v; npm -v; pnpm -v
 
-# ---------- 4. firewall (optional) -----------------------------------------
-if [[ "$SETUP_FIREWALL" == "1" ]]; then
-  log "Configuring UFW (allow OpenSSH + 80 + 443)"
-  ufw allow OpenSSH || true
-  ufw allow 80/tcp  || true
-  ufw allow 443/tcp || true
-  yes | ufw enable >/dev/null
-  ufw status verbose || true
-fi
+# ---------- 4. (firewall moved to harden-server.sh) ------------------------
+# UFW is configured by the dedicated hardening script. This keeps the network
+# policy in one place with the rest of the security baseline.
 
 # ---------- 5. paperclip user shell + per-user npm prefix ------------------
 log "Configuring shell + per-user npm prefix for ${PAPERCLIP_USER}"
@@ -461,16 +454,17 @@ Next steps:
      idempotent overlay (heals the patch if a merge dropped it), rebuilds,
      and restarts the service.
 
-  7. Lock the box down (key-only SSH, UFW, fail2ban, sysctl, auto sec.
+  7. Lock the box down (UFW, key-only SSH, fail2ban, sysctl, auto sec.
      updates) with the companion hardening script. RUN THIS LAST and only
-     after you have copied an SSH public key for ${PAPERCLIP_USER} (or any
-     other user you intend to log in as) — the script refuses to disable
-     password auth otherwise, but be sure first:
+     after a public key for ${PAPERCLIP_USER} is in
+     /home/${PAPERCLIP_USER}/.ssh/authorized_keys — the script refuses to
+     disable password auth otherwise:
 
-       # On your local machine:
-       ssh-copy-id ${PAPERCLIP_USER}@<this-server>
-
-       # Then on the server:
        sudo SSH_USERS="${PAPERCLIP_USER}" bash harden-server.sh
+
+  TIP — to do steps 1, 6 and 7 in one go from your local Mac/Linux machine,
+        use the bootstrap script that ships with this repo:
+
+       ./bootstrap.sh ${PAPERCLIP_USER:+--paperclip-user ${PAPERCLIP_USER} }root@<your-server>
 
 DONE

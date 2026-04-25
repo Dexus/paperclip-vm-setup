@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  bootstrap.sh — one-shot remote install for the Paperclip VM, run LOCALLY
+#                 from your macOS or Linux machine.
+# ----------------------------------------------------------------------------
+#  What it does (in order, fully automatic):
+#    1. Makes sure you have a local SSH key (~/.ssh/id_ed25519) — generates
+#       one with no passphrase if you don't, so the rest of the run is
+#       non-interactive.
+#    2. Pushes your public key into the admin user's authorized_keys on the
+#       target host (one password prompt at most — the only interactive
+#       moment in the whole flow).
+#    3. Uploads setup-paperclip.sh, update-paperclip.sh and harden-server.sh
+#       to the target.
+#    4. Runs setup-paperclip.sh as root over SSH.
+#    5. Installs your public key into the freshly-created paperclip user's
+#       authorized_keys (this is what makes the next step lockout-safe).
+#    6. Runs harden-server.sh as root over SSH (UFW, key-only SSH,
+#       fail2ban, sysctl, …). This is the step that disables password SSH,
+#       so it intentionally runs LAST and only after step 5 succeeded.
+#    7. Verifies key-only SSH still works for the paperclip user before
+#       declaring success.
+#
+#  Why this exists:
+#    Doing setup + hardening manually means a user can lock themselves out
+#    by enabling key-only SSH before the key is in place. This script
+#    sequences the steps so that's impossible: the hardening step is
+#    gated on a working key for the paperclip user.
+#
+#  Requirements on your local machine:
+#    - bash 4+ (macOS: `brew install bash` if you want it, but the system
+#      bash works for this script — we don't use 4-only features).
+#    - openssh client (ssh, scp, ssh-keygen). macOS ships these.
+#    - sshpass is NOT required; we rely on the ssh agent / ControlMaster.
+#
+#  Requirements on the target:
+#    - Fresh Ubuntu 22.04 / 24.04 or Debian 12.
+#    - You can reach it as root (or any sudo-capable user) over SSH —
+#      either with a password or with a key already installed (e.g. the
+#      cloud provider injected one).
+#
+#  Usage:
+#    ./bootstrap.sh user@host
+#    ./bootstrap.sh -p 2222 root@1.2.3.4
+#    ./bootstrap.sh --domain paperclip.example.com --grant-sudo \
+#                   ubuntu@vm.example.com
+#
+#  Re-running is safe: every remote step is idempotent.
+# ============================================================================
+
+set -euo pipefail
+
+# ---------- defaults --------------------------------------------------------
+SSH_PORT=22
+IDENTITY=""
+PAPERCLIP_USER="paperclip"
+PAPERCLIP_DOMAIN="_"
+NODE_MAJOR="24"
+RUN_HARDEN=1
+DISABLE_PASSWORDS=1
+GRANT_SUDO=0
+REMOTE_WORKDIR="/root/paperclip-vm-setup"
+
+usage() {
+  cat <<USAGE
+Usage: $0 [options] <user@host>
+
+Provisions Paperclip on a fresh remote VM and applies the hardening
+baseline, fully automated from your local machine.
+
+Options:
+  -p, --port PORT             SSH port (default: 22)
+  -i, --identity FILE         SSH private key to use (default:
+                              ~/.ssh/id_ed25519, auto-generated if missing)
+      --paperclip-user NAME   Service user name (default: paperclip)
+      --domain DOMAIN         nginx server_name (default: catch-all '_')
+      --node-major N          Node major to install (default: 24)
+      --grant-sudo            Give the paperclip user sudo access
+      --no-harden             Skip running harden-server.sh
+      --keep-passwords        Leave SSH password auth enabled in hardening
+  -h, --help                  Show this help
+
+Examples:
+  $0 root@1.2.3.4
+  $0 -p 2222 ubuntu@vm.example.com
+  $0 --domain paperclip.example.com --grant-sudo root@1.2.3.4
+USAGE
+}
+
+log()  { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
+die()  { printf '\033[1;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# ---------- arg parse -------------------------------------------------------
+TARGET=""
+while (( $# > 0 )); do
+  case "$1" in
+    -p|--port)             SSH_PORT="$2"; shift 2 ;;
+    -i|--identity)         IDENTITY="$2"; shift 2 ;;
+    --paperclip-user)      PAPERCLIP_USER="$2"; shift 2 ;;
+    --domain)              PAPERCLIP_DOMAIN="$2"; shift 2 ;;
+    --node-major)          NODE_MAJOR="$2"; shift 2 ;;
+    --grant-sudo)          GRANT_SUDO=1; shift ;;
+    --no-harden)           RUN_HARDEN=0; shift ;;
+    --keep-passwords)      DISABLE_PASSWORDS=0; shift ;;
+    -h|--help)             usage; exit 0 ;;
+    --)                    shift; break ;;
+    -*)                    die "unknown flag: $1 (use --help)" ;;
+    *)
+      [[ -z "$TARGET" ]] || die "unexpected extra argument: $1"
+      TARGET="$1"; shift ;;
+  esac
+done
+[[ -n "${TARGET:-}" ]] || { usage; exit 2; }
+
+if ! [[ "$TARGET" == *@* ]]; then
+  die "TARGET must be in the form user@host (got: '$TARGET')"
+fi
+ADMIN_USER="${TARGET%@*}"
+HOST="${TARGET#*@}"
+
+if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || (( SSH_PORT < 1 || SSH_PORT > 65535 )); then
+  die "SSH port '$SSH_PORT' is not valid"
+fi
+
+# ---------- local prereqs ---------------------------------------------------
+for cmd in ssh scp ssh-keygen; do
+  command -v "$cmd" >/dev/null 2>&1 || die "missing local command: $cmd"
+done
+
+# Resolve identity. If user didn't pass -i and they have no key at all,
+# generate ed25519. If they passed -i, that file MUST exist.
+if [[ -n "$IDENTITY" ]]; then
+  [[ -f "$IDENTITY" ]] || die "identity file not found: $IDENTITY"
+else
+  if [[ -f "$HOME/.ssh/id_ed25519" ]]; then
+    IDENTITY="$HOME/.ssh/id_ed25519"
+  elif [[ -f "$HOME/.ssh/id_rsa" ]]; then
+    IDENTITY="$HOME/.ssh/id_rsa"
+  else
+    log "No local SSH key found — generating $HOME/.ssh/id_ed25519"
+    install -d -m 700 "$HOME/.ssh"
+    ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519" \
+      -C "$(whoami)@$(hostname)-paperclip-bootstrap"
+    IDENTITY="$HOME/.ssh/id_ed25519"
+  fi
+fi
+PUBKEY_FILE="${IDENTITY}.pub"
+[[ -f "$PUBKEY_FILE" ]] || die "public key not found beside $IDENTITY (expected $PUBKEY_FILE)"
+PUBKEY_CONTENT="$(cat "$PUBKEY_FILE")"
+
+log "Using identity: $IDENTITY"
+log "Target: ${ADMIN_USER}@${HOST}:${SSH_PORT}"
+log "Paperclip user: ${PAPERCLIP_USER}"
+log "Domain: ${PAPERCLIP_DOMAIN}"
+log "Run hardening: $([[ "$RUN_HARDEN" == "1" ]] && echo yes || echo no)"
+
+# ---------- locate the script bundle next to this file --------------------
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for f in setup-paperclip.sh update-paperclip.sh harden-server.sh; do
+  [[ -f "$SELF_DIR/$f" ]] || die "missing $SELF_DIR/$f — run bootstrap from the repo root"
+done
+
+# ---------- SSH ControlMaster (one TCP connection, many commands) ---------
+CONTROL_DIR="$(mktemp -d -t paperclip-bootstrap.XXXXXX)"
+trap 'ssh -O exit -o ControlPath="$CONTROL_DIR/cm-%C" -p "$SSH_PORT" "${ADMIN_USER}@${HOST}" 2>/dev/null || true; rm -rf "$CONTROL_DIR"' EXIT
+
+SSH_COMMON=(
+  -o "ControlMaster=auto"
+  -o "ControlPath=$CONTROL_DIR/cm-%C"
+  -o "ControlPersist=10m"
+  -o "ConnectTimeout=15"
+  -o "ServerAliveInterval=30"
+  -o "ServerAliveCountMax=4"
+  -o "StrictHostKeyChecking=accept-new"
+  -i "$IDENTITY"
+  -p "$SSH_PORT"
+)
+SCP_COMMON=(
+  -o "ControlMaster=auto"
+  -o "ControlPath=$CONTROL_DIR/cm-%C"
+  -o "ControlPersist=10m"
+  -o "ConnectTimeout=15"
+  -o "StrictHostKeyChecking=accept-new"
+  -i "$IDENTITY"
+  -P "$SSH_PORT"
+)
+
+ssh_admin()  { ssh "${SSH_COMMON[@]}" "${ADMIN_USER}@${HOST}" "$@"; }
+scp_to()     { scp "${SCP_COMMON[@]}" "$@"; }
+
+# ---------- 1. push key to admin user (one password prompt at worst) ------
+log "Ensuring ${ADMIN_USER}@${HOST} accepts our key"
+# Try a key-only login first. If that already works (cloud provider injected
+# the key, or you've used this host before), we skip the password prompt.
+if ssh "${SSH_COMMON[@]}" -o BatchMode=yes -o PreferredAuthentications=publickey \
+       "${ADMIN_USER}@${HOST}" 'true' 2>/dev/null; then
+  log "Key auth to ${ADMIN_USER}@${HOST} already works — no password needed"
+else
+  log "Key auth not yet trusted — copying public key (will prompt for password)"
+  if command -v ssh-copy-id >/dev/null 2>&1; then
+    ssh-copy-id -i "$PUBKEY_FILE" -p "$SSH_PORT" \
+      -o "StrictHostKeyChecking=accept-new" \
+      "${ADMIN_USER}@${HOST}" \
+      || die "ssh-copy-id failed — check the password and try again"
+  else
+    # Fallback: append the key over an interactive ssh session.
+    cat "$PUBKEY_FILE" | ssh -p "$SSH_PORT" \
+      -o "StrictHostKeyChecking=accept-new" \
+      "${ADMIN_USER}@${HOST}" '
+        set -e
+        umask 077
+        mkdir -p ~/.ssh
+        cat >> ~/.ssh/authorized_keys
+        sort -u -o ~/.ssh/authorized_keys ~/.ssh/authorized_keys
+        chmod 700 ~/.ssh
+        chmod 600 ~/.ssh/authorized_keys
+      ' || die "manual key install failed"
+  fi
+fi
+
+# Verify key login *now* before we do anything else.
+ssh_admin -o BatchMode=yes -o PreferredAuthentications=publickey 'echo ok' >/dev/null \
+  || die "key login still doesn't work for ${ADMIN_USER}@${HOST} — aborting"
+
+# Build a sudo prefix for the admin user (no-op if admin is root).
+if [[ "$ADMIN_USER" == "root" ]]; then
+  SUDO=""
+else
+  SUDO="sudo "
+fi
+
+# ---------- 2. upload script bundle ---------------------------------------
+log "Uploading scripts to ${REMOTE_WORKDIR}"
+ssh_admin "${SUDO}install -d -m 0755 -o ${ADMIN_USER} ${REMOTE_WORKDIR}"
+scp_to \
+  "$SELF_DIR/setup-paperclip.sh" \
+  "$SELF_DIR/update-paperclip.sh" \
+  "$SELF_DIR/harden-server.sh" \
+  "${ADMIN_USER}@${HOST}:${REMOTE_WORKDIR}/"
+ssh_admin "chmod +x ${REMOTE_WORKDIR}/*.sh"
+
+# ---------- 3. run setup-paperclip.sh --------------------------------------
+log "Running setup-paperclip.sh on the remote (this can take several minutes)"
+# Pass our knobs through. SETUP_NGINX/SYSTEMD stay on by default.
+ssh_admin "${SUDO}env \
+  PAPERCLIP_USER='${PAPERCLIP_USER}' \
+  PAPERCLIP_DOMAIN='${PAPERCLIP_DOMAIN}' \
+  NODE_MAJOR='${NODE_MAJOR}' \
+  GRANT_SUDO='${GRANT_SUDO}' \
+  bash ${REMOTE_WORKDIR}/setup-paperclip.sh"
+
+# ---------- 4. install our key for the paperclip user ---------------------
+# This is the lockout-safety prerequisite for the hardening step. We do it
+# *before* harden-server.sh so the key check there always passes.
+log "Installing public key for ${PAPERCLIP_USER}@${HOST}"
+ssh_admin "${SUDO}bash -s -- '${PAPERCLIP_USER}'" <<EOF
+set -e
+PU="\$1"
+HOME_DIR="\$(getent passwd "\$PU" | cut -d: -f6)"
+[ -n "\$HOME_DIR" ] && [ -d "\$HOME_DIR" ] || { echo "no home for \$PU" >&2; exit 1; }
+install -d -m 700 -o "\$PU" -g "\$PU" "\$HOME_DIR/.ssh"
+AK="\$HOME_DIR/.ssh/authorized_keys"
+touch "\$AK"
+chown "\$PU:\$PU" "\$AK"
+chmod 600 "\$AK"
+KEY=$(printf '%q' "$PUBKEY_CONTENT")
+grep -qxF "\$KEY" "\$AK" || printf '%s\n' "\$KEY" >> "\$AK"
+EOF
+
+# Verify by actually logging in as the paperclip user with the key.
+log "Verifying key login as ${PAPERCLIP_USER}@${HOST}"
+if ! ssh "${SSH_COMMON[@]}" -o BatchMode=yes \
+       -o PreferredAuthentications=publickey \
+       -o ControlPath="$CONTROL_DIR/cm-paperclip-%C" \
+       "${PAPERCLIP_USER}@${HOST}" 'echo ok' >/dev/null 2>&1; then
+  die "key login as ${PAPERCLIP_USER} failed — refusing to run hardening (would lock you out). Check sshd config and authorized_keys."
+fi
+
+# ---------- 5. run harden-server.sh ---------------------------------------
+if [[ "$RUN_HARDEN" == "1" ]]; then
+  log "Running harden-server.sh on the remote"
+  # Allow the admin user too (so you don't lose the bastion if you set one
+  # up later), but always allow paperclip.
+  if [[ "$ADMIN_USER" != "root" && "$ADMIN_USER" != "$PAPERCLIP_USER" ]]; then
+    SSH_USERS_LIST="${PAPERCLIP_USER} ${ADMIN_USER}"
+    # Make sure the admin user also has the key (idempotent).
+    ssh_admin "${SUDO}bash -s -- '${ADMIN_USER}'" <<EOF
+set -e
+PU="\$1"
+HOME_DIR="\$(getent passwd "\$PU" | cut -d: -f6)"
+install -d -m 700 -o "\$PU" -g "\$PU" "\$HOME_DIR/.ssh"
+AK="\$HOME_DIR/.ssh/authorized_keys"
+touch "\$AK"; chown "\$PU:\$PU" "\$AK"; chmod 600 "\$AK"
+KEY=$(printf '%q' "$PUBKEY_CONTENT")
+grep -qxF "\$KEY" "\$AK" || printf '%s\n' "\$KEY" >> "\$AK"
+EOF
+  else
+    SSH_USERS_LIST="${PAPERCLIP_USER}"
+  fi
+
+  ssh_admin "${SUDO}env \
+    SSH_USERS='${SSH_USERS_LIST}' \
+    SSH_PORT='${SSH_PORT}' \
+    DISABLE_PASSWORDS='${DISABLE_PASSWORDS}' \
+    bash ${REMOTE_WORKDIR}/harden-server.sh"
+
+  # ---------- 6. post-harden verification ---------------------------------
+  # The hardening step reloaded sshd. Re-verify the paperclip key login on
+  # a *fresh* TCP connection (the ControlMaster session is still on the old
+  # daemon).
+  log "Re-verifying key login after sshd reload"
+  if ! ssh -o BatchMode=yes -o ConnectTimeout=15 \
+           -o PreferredAuthentications=publickey \
+           -o StrictHostKeyChecking=accept-new \
+           -i "$IDENTITY" -p "$SSH_PORT" \
+           "${PAPERCLIP_USER}@${HOST}" 'echo ok' >/dev/null 2>&1; then
+    die "key login as ${PAPERCLIP_USER} broke after hardening. The old session is still open; investigate before logging out!"
+  fi
+else
+  warn "--no-harden: skipping harden-server.sh. The server is NOT yet locked down."
+fi
+
+# ---------- done -----------------------------------------------------------
+cat <<DONE
+
+\033[1;32mAll done.\033[0m
+
+Connect:
+    ssh -i ${IDENTITY} -p ${SSH_PORT} ${PAPERCLIP_USER}@${HOST}
+
+Service status:
+    ssh -i ${IDENTITY} -p ${SSH_PORT} ${ADMIN_USER}@${HOST} '${SUDO}systemctl status paperclip --no-pager'
+
+Web UI (via nginx):
+    http://${PAPERCLIP_DOMAIN/_/$HOST}/
+
+To update Paperclip later:
+    ssh -i ${IDENTITY} -p ${SSH_PORT} ${ADMIN_USER}@${HOST} '${SUDO}bash ${REMOTE_WORKDIR}/update-paperclip.sh'
+
+DONE
