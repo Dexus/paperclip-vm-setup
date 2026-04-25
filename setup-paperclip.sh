@@ -72,6 +72,12 @@ WIREGUARD_PORT="${WIREGUARD_PORT:-51820}"   # UDP listen port
 WIREGUARD_NET="${WIREGUARD_NET:-10.7.0.0/24}"
 WIREGUARD_SERVER_IP="${WIREGUARD_SERVER_IP:-10.7.0.1}"
 PAPERCLIP_START_CMD="${PAPERCLIP_START_CMD:-pnpm dev:once}"
+PAPERCLIP_ALLOWED_HOSTNAMES="${PAPERCLIP_ALLOWED_HOSTNAMES:-}"  # comma-sep
+# extra hostnames to register via `pnpm paperclipai allowed-hostname`.
+# The script automatically adds:
+#   - $PAPERCLIP_DOMAIN (when not the catch-all "_")
+#   - $WIREGUARD_SERVER_IP (when SETUP_WIREGUARD=1)
+# Anything you list here is added on top.
 # ---------------------------------------------------------------------------
 
 log()  { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
@@ -285,6 +291,36 @@ pnpm build
 if [[ ! -f "${PAPERCLIP_HOME}/paperclip/.env" && -f "${PAPERCLIP_HOME}/paperclip/.env.example" ]]; then
   log "Seeding .env from .env.example (review before going to production)"
   as_paperclip '[ -e "$HOME/paperclip/.env" ] || cp "$HOME/paperclip/.env.example" "$HOME/paperclip/.env"'
+fi
+
+# ---------- 6.5 register allowed hostnames --------------------------------
+# Paperclip rejects requests whose Host header isn't on its allow-list with
+#   "Hostname '<host>' is not allowed for this Paperclip instance."
+# Pre-register the hosts we know about: the public domain, the WireGuard
+# server IP (so peers can reach the UI through the tunnel), and anything
+# the operator listed in PAPERCLIP_ALLOWED_HOSTNAMES.
+allowed_hosts=()
+if [[ "$PAPERCLIP_DOMAIN" != "_" ]]; then
+  allowed_hosts+=("$PAPERCLIP_DOMAIN")
+fi
+if [[ "$SETUP_WIREGUARD" == "1" ]]; then
+  allowed_hosts+=("$WIREGUARD_SERVER_IP")
+fi
+if [[ -n "$PAPERCLIP_ALLOWED_HOSTNAMES" ]]; then
+  IFS=',' read -ra _extra_hosts <<< "$PAPERCLIP_ALLOWED_HOSTNAMES"
+  for h in "${_extra_hosts[@]}"; do
+    h="${h// /}"
+    [[ -n "$h" ]] && allowed_hosts+=("$h")
+  done
+fi
+# Dedup while preserving order, then register each via the Paperclip CLI.
+if (( ${#allowed_hosts[@]} > 0 )); then
+  mapfile -t allowed_hosts < <(printf '%s\n' "${allowed_hosts[@]}" | awk '!seen[$0]++')
+  log "Registering allowed hostnames: ${allowed_hosts[*]}"
+  for h in "${allowed_hosts[@]}"; do
+    as_paperclip "cd \"\$HOME/paperclip\" && pnpm paperclipai allowed-hostname $(printf '%q' "$h")" \
+      || warn "Could not register allowed-hostname '$h' — register it manually with: sudo -u $PAPERCLIP_USER -H bash -lc \"cd ~/paperclip && pnpm paperclipai allowed-hostname '$h'\""
+  done
 fi
 
 # ---------- 7. agent clients (all installed for paperclip user) ------------

@@ -61,6 +61,7 @@ DISABLE_PASSWORDS=1
 GRANT_SUDO=0
 SUDO_NOPASSWD=0
 SETUP_WIREGUARD=0
+ALLOWED_HOSTNAMES=()
 REMOTE_WORKDIR="/root/paperclip-vm-setup"
 # Trusted-IP whitelist: passed to harden-server.sh as TRUSTED_IPS so the
 # operator can never lock themselves out via fail2ban / UFW rate-limits.
@@ -93,6 +94,10 @@ Options:
       --wireguard             Install a WireGuard server (UDP 51820) on the
                               remote and add /usr/local/sbin/add-wg-peer
                               for minting client configs
+      --allowed-hostname H    Register H with `pnpm paperclipai allowed-hostname`
+                              after the build. Repeatable. The script always
+                              auto-registers --domain (when not catch-all)
+                              and the WireGuard server IP (with --wireguard).
       --no-harden             Skip running harden-server.sh
       --keep-passwords        Leave SSH password auth enabled in hardening
       --trust-ip IP           Whitelist this IP/CIDR on the SSH port and in
@@ -129,6 +134,7 @@ while (( $# > 0 )); do
     --grant-sudo)          GRANT_SUDO=1; shift ;;
     --sudo-nopasswd)       SUDO_NOPASSWD=1; shift ;;
     --wireguard)           SETUP_WIREGUARD=1; shift ;;
+    --allowed-hostname)    ALLOWED_HOSTNAMES+=("$2"); shift 2 ;;
     --no-harden)           RUN_HARDEN=0; shift ;;
     --keep-passwords)      DISABLE_PASSWORDS=0; shift ;;
     --trust-ip)            EXTRA_TRUST_IPS+=("$2"); shift 2 ;;
@@ -353,6 +359,10 @@ ssh_admin "chmod +x ${REMOTE_WORKDIR}/*.sh"
 # ---------- 3. run setup-paperclip.sh --------------------------------------
 log "Running setup-paperclip.sh on the remote (this can take several minutes)"
 # Pass our knobs through. SETUP_NGINX/SYSTEMD stay on by default.
+ALLOWED_HOSTNAMES_CSV=""
+if (( ${#ALLOWED_HOSTNAMES[@]} > 0 )); then
+  ALLOWED_HOSTNAMES_CSV="$(IFS=,; echo "${ALLOWED_HOSTNAMES[*]}")"
+fi
 ssh_admin "${SUDO}env \
   PAPERCLIP_USER='${PAPERCLIP_USER}' \
   PAPERCLIP_DOMAIN='${PAPERCLIP_DOMAIN}' \
@@ -360,6 +370,7 @@ ssh_admin "${SUDO}env \
   GRANT_SUDO='${GRANT_SUDO}' \
   SUDO_NOPASSWD='${SUDO_NOPASSWD}' \
   SETUP_WIREGUARD='${SETUP_WIREGUARD}' \
+  PAPERCLIP_ALLOWED_HOSTNAMES='${ALLOWED_HOSTNAMES_CSV}' \
   bash ${REMOTE_WORKDIR}/setup-paperclip.sh"
 
 # ---------- 4. install our key for the paperclip user ---------------------
