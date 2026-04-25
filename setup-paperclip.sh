@@ -658,7 +658,12 @@ fi
 echo
 echo "Reach the Paperclip UI from this peer at:  http://${SERVER_NET}/"
 PEEREOF
-  chmod 0750 /usr/local/sbin/add-wg-peer
+  # 0755 (not 0750) so non-root invocations can at least *find* the script
+  # and see its "run as root" message — with 0750, plain `add-wg-peer` from
+  # the paperclip user gets the confusing "Permission denied" instead.
+  # The script still refuses to run without root, so this isn't a privilege
+  # leak.
+  chmod 0755 /usr/local/sbin/add-wg-peer
 
   log "Enabling wg-quick@wg0"
   systemctl enable --now wg-quick@wg0
