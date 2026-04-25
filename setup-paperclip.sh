@@ -69,6 +69,9 @@ PAPERCLIP_START_CMD="${PAPERCLIP_START_CMD:-pnpm dev:once}"
 log()  { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
+# ANSI-C quoting puts real ESC bytes into the variables, so they can be
+# interpolated into heredocs (which don't expand \033 escapes themselves).
+C_GREEN=$'\033[1;32m'; C_YELLOW=$'\033[1;33m'; C_RESET=$'\033[0m'
 
 # ---------- 0. preflight ----------------------------------------------------
 [[ $EUID -eq 0 ]] || die "Run as root (or with sudo)."
@@ -179,22 +182,34 @@ node -v; npm -v; pnpm -v
 # policy in one place with the rest of the security baseline.
 
 # ---------- 5. paperclip user shell + per-user npm prefix ------------------
+# Centralise the PATH export in ~/.paperclip-env and source it from BOTH
+# .bashrc (for interactive shells) AND .profile (for login + non-interactive
+# `bash -lc`, which is what every `as_paperclip` call here uses). Debian's
+# stock .bashrc returns early on non-interactive shells, so PATH set there
+# alone wouldn't survive `bash -lc` and the agent binaries we just installed
+# would look "missing" right after install.
 log "Configuring shell + per-user npm prefix for ${PAPERCLIP_USER}"
 as_paperclip '
 set -e
 mkdir -p "$HOME/.npm-global" "$HOME/.local/bin"
 npm config set prefix "$HOME/.npm-global"
 
-bashrc="$HOME/.bashrc"
-touch "$bashrc"
-if ! grep -q "PAPERCLIP_PATHS" "$bashrc"; then
-  cat >> "$bashrc" << "EOF"
+cat > "$HOME/.paperclip-env" << "EOF"
+# Managed by setup-paperclip.sh — sourced from .bashrc and .profile.
+export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.hermes/bin:$HOME/.claude/bin:$HOME/.opencode/bin:$PATH"
+EOF
+
+for rc in "$HOME/.bashrc" "$HOME/.profile"; do
+  touch "$rc"
+  if ! grep -q "PAPERCLIP_PATHS" "$rc"; then
+    cat >> "$rc" << "EOF"
 
 # --- PAPERCLIP_PATHS -------------------------------------------------------
-export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.hermes/bin:$HOME/.claude/bin:$HOME/.opencode/bin:$PATH"
+[ -f "$HOME/.paperclip-env" ] && . "$HOME/.paperclip-env"
 # --- /PAPERCLIP_PATHS ------------------------------------------------------
 EOF
-fi
+  fi
+done
 '
 
 # ---------- 6. clone + build Paperclip -------------------------------------
@@ -631,7 +646,7 @@ fi
 # ---------- done ------------------------------------------------------------
 cat <<DONE
 
-\033[1;32mAll done.\033[0m
+${C_GREEN}All done.${C_RESET}
 
 Next steps:
   1. Authenticate each agent client once (interactively) as ${PAPERCLIP_USER}:

@@ -94,6 +94,8 @@ USAGE
 log()  { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
+# Real ESC bytes for use inside heredocs (which don't interpret \033).
+C_GREEN=$'\033[1;32m'; C_YELLOW=$'\033[1;33m'; C_RED=$'\033[1;31m'; C_RESET=$'\033[0m'
 
 # ---------- arg parse -------------------------------------------------------
 TARGET=""
@@ -197,7 +199,7 @@ print_rescue_info() {
   rescue_ssh="ssh -o ControlPath=\"${CONTROL_DIR}/%C\" -i \"${IDENTITY}\" -p ${SSH_PORT} ${ADMIN_USER}@${HOST}"
   cat >&2 <<RESCUE
 
-$(printf '\033[1;31m')!!! RESCUE SHELL AVAILABLE !!!$(printf '\033[0m')
+${C_RED}!!! RESCUE SHELL AVAILABLE !!!${C_RESET}
 
 The admin SSH ControlMaster session is still open and authenticated.
 You can drop into a working shell on ${HOST} WITHOUT re-authenticating
@@ -372,7 +374,7 @@ EOF
   log "Running harden-server.sh on the remote"
   cat <<HEADSUP
 
-\033[1;33mHeads-up: the next step touches sshd.\033[0m If hardening misfires, the
+${C_YELLOW}Heads-up: the next step touches sshd.${C_RESET} If hardening misfires, the
 existing admin SSH session stays open as a rescue shell. Save this
 command somewhere you can paste it from another terminal:
 
@@ -413,7 +415,7 @@ fi
 # ---------- done -----------------------------------------------------------
 cat <<DONE
 
-\033[1;32mAll done.\033[0m
+${C_GREEN}All done.${C_RESET}
 
 Connect:
     ssh -i ${IDENTITY} -p ${SSH_PORT} ${PAPERCLIP_USER}@${HOST}

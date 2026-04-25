@@ -68,6 +68,8 @@ BANNER_TEXT="${BANNER_TEXT:-}"
 log()  { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
+# Real ESC bytes for use inside heredocs (which don't interpret \033).
+C_GREEN=$'\033[1;32m'; C_YELLOW=$'\033[1;33m'; C_RESET=$'\033[0m'
 
 # ---------- 0. preflight ----------------------------------------------------
 [[ $EUID -eq 0 ]] || die "Run as root (or with sudo)."
@@ -276,7 +278,9 @@ if [[ -n "$WG_PORT" ]]; then
 fi
 
 ufw logging low
-yes | ufw enable >/dev/null
+# Use --force, not `yes | ufw enable`: under `set -o pipefail`, SIGPIPE on yes
+# (when ufw stops reading) propagates as pipeline failure and trips set -e.
+ufw --force enable >/dev/null
 ufw status verbose || true
 
 # ---------- 5. fail2ban -----------------------------------------------------
@@ -426,7 +430,7 @@ fi
 # ---------- done -----------------------------------------------------------
 cat <<DONE
 
-\033[1;32mServer hardening applied.\033[0m
+${C_GREEN}Server hardening applied.${C_RESET}
 
 Quick checklist:
   - SSH:       port ${SSH_PORT}, key-only=$([[ "$DISABLE_PASSWORDS" == "1" ]] && echo yes || echo NO),
@@ -437,7 +441,7 @@ Quick checklist:
   - Kernel:    $([[ "$HARDEN_KERNEL" == "1" ]] && echo sysctl drop-in installed || echo skipped)
   - Root pwd:  $([[ "$LOCK_ROOT_PASSWORD" == "1" ]] && echo locked || echo unchanged)
 
-\033[1;33mBefore you log out:\033[0m open a SECOND ssh session to verify you can
+${C_YELLOW}Before you log out:${C_RESET} open a SECOND ssh session to verify you can
 still log in with your key. If you can't, fix it from the active session —
 once you log out, a broken sshd config can lock you out for good.
 
