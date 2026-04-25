@@ -78,10 +78,28 @@ as_paperclip() {
 }
 
 # ---------- 1. user ---------------------------------------------------------
-log "Ensuring user '${PAPERCLIP_USER}' exists"
+log "Ensuring user '${PAPERCLIP_USER}' exists with a real home"
 if ! id "$PAPERCLIP_USER" >/dev/null 2>&1; then
-  adduser --disabled-password --gecos "" "$PAPERCLIP_USER"
+  adduser --disabled-password --gecos "" --home "$PAPERCLIP_HOME" "$PAPERCLIP_USER"
 fi
+
+# Repair an existing user whose home is missing or set to /nonexistent
+# (happens when the account was previously created via `useradd -r` or
+# similar). Without this, every `as_paperclip` call below tries to write
+# into /nonexistent and fails.
+cur_home="$(getent passwd "$PAPERCLIP_USER" | cut -d: -f6)"
+if [[ "$cur_home" != "$PAPERCLIP_HOME" || ! -d "$cur_home" ]]; then
+  log "Repairing home for '${PAPERCLIP_USER}' (was: '${cur_home:-<unset>}' -> '${PAPERCLIP_HOME}')"
+  usermod -d "$PAPERCLIP_HOME" "$PAPERCLIP_USER"
+  install -d -m 0755 -o "$PAPERCLIP_USER" -g "$PAPERCLIP_USER" "$PAPERCLIP_HOME"
+  for skel in .bashrc .profile .bash_logout; do
+    if [[ -f "/etc/skel/$skel" && ! -e "$PAPERCLIP_HOME/$skel" ]]; then
+      cp "/etc/skel/$skel" "$PAPERCLIP_HOME/$skel"
+      chown "$PAPERCLIP_USER:$PAPERCLIP_USER" "$PAPERCLIP_HOME/$skel"
+    fi
+  done
+fi
+
 if [[ "$GRANT_SUDO" == "1" ]]; then
   usermod -aG sudo "$PAPERCLIP_USER"
   warn "Granted '${PAPERCLIP_USER}' sudo access (GRANT_SUDO=1)."
