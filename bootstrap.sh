@@ -162,13 +162,21 @@ for f in setup-paperclip.sh update-paperclip.sh harden-server.sh; do
 done
 
 # ---------- SSH ControlMaster (one TCP connection, many commands) ---------
-CONTROL_DIR="$(mktemp -d -t paperclip-bootstrap.XXXXXX)"
+# We deliberately put the socket under ~/.ssh and use just %C as the
+# filename (no extra prefix). UNIX socket paths are capped at 104 bytes on
+# macOS (108 on Linux), and macOS's default $TMPDIR is
+# /var/folders/.../T/ which already eats ~50 chars. ~/.ssh keeps the path
+# well under the limit on every platform we target and is already mode
+# 700, so it's also the right place security-wise.
+install -d -m 700 "$HOME/.ssh"
+CONTROL_DIR="$(mktemp -d "$HOME/.ssh/pcb.XXXXXX")"
+chmod 700 "$CONTROL_DIR"
 SKIP_CLEANUP=0
 cleanup() {
   if [[ "$SKIP_CLEANUP" == "1" ]]; then
     return
   fi
-  ssh -O exit -o ControlPath="$CONTROL_DIR/cm-%C" -p "$SSH_PORT" \
+  ssh -O exit -o ControlPath="$CONTROL_DIR/%C" -p "$SSH_PORT" \
       "${ADMIN_USER}@${HOST}" 2>/dev/null || true
   rm -rf "$CONTROL_DIR"
 }
@@ -181,7 +189,7 @@ trap cleanup EXIT
 # our escape hatch when key login is broken.
 print_rescue_info() {
   local rescue_ssh
-  rescue_ssh="ssh -o ControlPath=\"${CONTROL_DIR}/cm-%C\" -i \"${IDENTITY}\" -p ${SSH_PORT} ${ADMIN_USER}@${HOST}"
+  rescue_ssh="ssh -o ControlPath=\"${CONTROL_DIR}/%C\" -i \"${IDENTITY}\" -p ${SSH_PORT} ${ADMIN_USER}@${HOST}"
   cat >&2 <<RESCUE
 
 $(printf '\033[1;31m')!!! RESCUE SHELL AVAILABLE !!!$(printf '\033[0m')
@@ -216,14 +224,14 @@ fresh terminal while you debug keys):
 Once you have verified login works from a brand-new terminal, close
 the rescue master cleanly with:
 
-    ssh -O exit -o ControlPath="${CONTROL_DIR}/cm-%C" -i "${IDENTITY}" -p ${SSH_PORT} ${ADMIN_USER}@${HOST}
+    ssh -O exit -o ControlPath="${CONTROL_DIR}/%C" -i "${IDENTITY}" -p ${SSH_PORT} ${ADMIN_USER}@${HOST}
 
 RESCUE
 }
 
 SSH_COMMON=(
   -o "ControlMaster=auto"
-  -o "ControlPath=$CONTROL_DIR/cm-%C"
+  -o "ControlPath=$CONTROL_DIR/%C"
   -o "ControlPersist=10m"
   -o "ConnectTimeout=15"
   -o "ServerAliveInterval=30"
@@ -234,7 +242,7 @@ SSH_COMMON=(
 )
 SCP_COMMON=(
   -o "ControlMaster=auto"
-  -o "ControlPath=$CONTROL_DIR/cm-%C"
+  -o "ControlPath=$CONTROL_DIR/%C"
   -o "ControlPersist=10m"
   -o "ConnectTimeout=15"
   -o "StrictHostKeyChecking=accept-new"
@@ -325,10 +333,11 @@ grep -qxF "\$KEY" "\$AK" || printf '%s\n' "\$KEY" >> "\$AK"
 EOF
 
 # Verify by actually logging in as the paperclip user with the key.
+# %C in ControlPath hashes the remote user too, so this transparently uses
+# a separate socket from the admin-user master.
 log "Verifying key login as ${PAPERCLIP_USER}@${HOST}"
 if ! ssh "${SSH_COMMON[@]}" -o BatchMode=yes \
        -o PreferredAuthentications=publickey \
-       -o ControlPath="$CONTROL_DIR/cm-paperclip-%C" \
        "${PAPERCLIP_USER}@${HOST}" 'echo ok' >/dev/null 2>&1; then
   die "key login as ${PAPERCLIP_USER} failed — refusing to run hardening (would lock you out). Check sshd config and authorized_keys."
 fi
@@ -361,7 +370,7 @@ EOF
 existing admin SSH session stays open as a rescue shell. Save this
 command somewhere you can paste it from another terminal:
 
-    ssh -o ControlPath="${CONTROL_DIR}/cm-%C" -i "${IDENTITY}" -p ${SSH_PORT} ${ADMIN_USER}@${HOST}
+    ssh -o ControlPath="${CONTROL_DIR}/%C" -i "${IDENTITY}" -p ${SSH_PORT} ${ADMIN_USER}@${HOST}
 
 (That path is unique to this run; it's lost if you close this terminal
 without copying it. Full triage instructions are printed on failure.)
