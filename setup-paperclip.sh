@@ -241,7 +241,7 @@ pnpm build
 
 if [[ ! -f "${PAPERCLIP_HOME}/paperclip/.env" && -f "${PAPERCLIP_HOME}/paperclip/.env.example" ]]; then
   log "Seeding .env from .env.example (review before going to production)"
-  as_paperclip 'cp -n "$HOME/paperclip/.env.example" "$HOME/paperclip/.env"'
+  as_paperclip '[ -e "$HOME/paperclip/.env" ] || cp "$HOME/paperclip/.env.example" "$HOME/paperclip/.env"'
 fi
 
 # ---------- 7. agent clients (all installed for paperclip user) ------------
