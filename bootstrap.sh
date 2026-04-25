@@ -59,6 +59,7 @@ NODE_MAJOR="24"
 RUN_HARDEN=1
 DISABLE_PASSWORDS=1
 GRANT_SUDO=0
+SUDO_NOPASSWD=0
 SETUP_WIREGUARD=0
 REMOTE_WORKDIR="/root/paperclip-vm-setup"
 # Trusted-IP whitelist: passed to harden-server.sh as TRUSTED_IPS so the
@@ -82,7 +83,13 @@ Options:
       --paperclip-user NAME   Service user name (default: paperclip)
       --domain DOMAIN         nginx server_name (default: catch-all '_')
       --node-major N          Node major to install (default: 24)
-      --grant-sudo            Give the paperclip user sudo access
+      --grant-sudo            Add the paperclip user to the sudo group.
+                              Note: the account is created with no password
+                              (key-only login), so plain sudo membership won't
+                              actually let it run sudo until you either set a
+                              password or pass --sudo-nopasswd.
+      --sudo-nopasswd         Drop a NOPASSWD sudoers rule for the paperclip
+                              user (only honoured with --grant-sudo).
       --wireguard             Install a WireGuard server (UDP 51820) on the
                               remote and add /usr/local/sbin/add-wg-peer
                               for minting client configs
@@ -120,6 +127,7 @@ while (( $# > 0 )); do
     --domain)              PAPERCLIP_DOMAIN="$2"; shift 2 ;;
     --node-major)          NODE_MAJOR="$2"; shift 2 ;;
     --grant-sudo)          GRANT_SUDO=1; shift ;;
+    --sudo-nopasswd)       SUDO_NOPASSWD=1; shift ;;
     --wireguard)           SETUP_WIREGUARD=1; shift ;;
     --no-harden)           RUN_HARDEN=0; shift ;;
     --keep-passwords)      DISABLE_PASSWORDS=0; shift ;;
@@ -134,6 +142,13 @@ while (( $# > 0 )); do
   esac
 done
 [[ -n "${TARGET:-}" ]] || { usage; exit 2; }
+
+# --sudo-nopasswd is meaningless without --grant-sudo; auto-imply rather
+# than silently ignoring it.
+if [[ "$SUDO_NOPASSWD" == "1" && "$GRANT_SUDO" != "1" ]]; then
+  warn "--sudo-nopasswd implies --grant-sudo; enabling sudo group membership too."
+  GRANT_SUDO=1
+fi
 
 if ! [[ "$TARGET" == *@* ]]; then
   die "TARGET must be in the form user@host (got: '$TARGET')"
@@ -343,6 +358,7 @@ ssh_admin "${SUDO}env \
   PAPERCLIP_DOMAIN='${PAPERCLIP_DOMAIN}' \
   NODE_MAJOR='${NODE_MAJOR}' \
   GRANT_SUDO='${GRANT_SUDO}' \
+  SUDO_NOPASSWD='${SUDO_NOPASSWD}' \
   SETUP_WIREGUARD='${SETUP_WIREGUARD}' \
   bash ${REMOTE_WORKDIR}/setup-paperclip.sh"
 

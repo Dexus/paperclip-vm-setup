@@ -57,6 +57,14 @@ PAPERCLIP_REPO="${PAPERCLIP_REPO:-https://github.com/paperclipai/paperclip.git}"
 HERMES_ADAPTER_PKG="${HERMES_ADAPTER_PKG:-hermes-paperclip-adapter}"
 NODE_MAJOR="${NODE_MAJOR:-24}"
 GRANT_SUDO="${GRANT_SUDO:-0}"               # 1 = add paperclip to sudo group
+SUDO_NOPASSWD="${SUDO_NOPASSWD:-0}"         # 1 = drop a NOPASSWD sudoers rule
+                                            #     for the paperclip user.
+                                            # Only honoured when GRANT_SUDO=1.
+                                            # When 0 *and* the user has no
+                                            # password, the user will be in
+                                            # the sudo group but unable to use
+                                            # sudo — the script warns about
+                                            # this.
 SETUP_NGINX="${SETUP_NGINX:-1}"             # 0 = skip nginx site
 SETUP_SYSTEMD="${SETUP_SYSTEMD:-1}"         # 0 = skip systemd unit
 SETUP_WIREGUARD="${SETUP_WIREGUARD:-0}"     # 1 = install WireGuard server
@@ -113,7 +121,41 @@ fi
 
 if [[ "$GRANT_SUDO" == "1" ]]; then
   usermod -aG sudo "$PAPERCLIP_USER"
-  warn "Granted '${PAPERCLIP_USER}' sudo access (GRANT_SUDO=1)."
+  # adduser --disabled-password leaves the account with no usable password.
+  # Membership in `sudo` alone does NOT give them working sudo in that case
+  # — sudo will prompt for a password they can't provide. Resolve this
+  # explicitly: either drop a NOPASSWD rule (SUDO_NOPASSWD=1) or warn the
+  # operator that they need to set a password before sudo will work.
+  has_password=0
+  if passwd -S "$PAPERCLIP_USER" 2>/dev/null | awk '{print $2}' | grep -qx 'P'; then
+    has_password=1
+  fi
+
+  if [[ "$SUDO_NOPASSWD" == "1" ]]; then
+    log "Writing /etc/sudoers.d/${PAPERCLIP_USER} (NOPASSWD)"
+    sudoers_file="/etc/sudoers.d/${PAPERCLIP_USER}"
+    cat > "${sudoers_file}.tmp" <<SUDOEOF
+# Managed by setup-paperclip.sh — passwordless sudo for the service user.
+${PAPERCLIP_USER} ALL=(ALL) NOPASSWD:ALL
+SUDOEOF
+    chmod 0440 "${sudoers_file}.tmp"
+    # Validate before swapping in — a broken sudoers file can lock everyone
+    # out of sudo for good. visudo -c rejects bad syntax with non-zero exit.
+    if visudo -cf "${sudoers_file}.tmp" >/dev/null; then
+      mv "${sudoers_file}.tmp" "${sudoers_file}"
+      warn "Granted '${PAPERCLIP_USER}' PASSWORDLESS sudo (GRANT_SUDO=1, SUDO_NOPASSWD=1)."
+    else
+      rm -f "${sudoers_file}.tmp"
+      die "visudo rejected the generated sudoers file — refusing to install it"
+    fi
+  elif [[ "$has_password" == "1" ]]; then
+    warn "Granted '${PAPERCLIP_USER}' sudo (password required at each call)."
+  else
+    warn "Granted '${PAPERCLIP_USER}' sudo group membership — but the account has NO password,"
+    warn "so sudo will REJECT every call until you either:"
+    warn "  - set a password:   sudo passwd ${PAPERCLIP_USER}"
+    warn "  - or re-run setup with SUDO_NOPASSWD=1 (passwordless sudo)"
+  fi
 fi
 
 # ---------- 2. system packages ---------------------------------------------
