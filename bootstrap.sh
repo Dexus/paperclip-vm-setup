@@ -169,7 +169,16 @@ else
 fi
 PUBKEY_FILE="${IDENTITY}.pub"
 [[ -f "$PUBKEY_FILE" ]] || die "public key not found beside $IDENTITY (expected $PUBKEY_FILE)"
+[[ -s "$PUBKEY_FILE" ]] || die "public key file $PUBKEY_FILE is EMPTY — re-generate it (rm -f $PUBKEY_FILE $IDENTITY then re-run)"
 PUBKEY_CONTENT="$(cat "$PUBKEY_FILE")"
+# Sanity-check the pubkey looks like a real OpenSSH public key. This catches
+# corrupted .pub files early, BEFORE we silently end up writing an empty
+# authorized_keys on the remote (grep -qxF "" matches everything).
+if ! [[ "$PUBKEY_CONTENT" =~ ^(ssh-(rsa|ed25519|dss)|ecdsa-sha2-[a-z0-9-]+|sk-(ssh-ed25519|ecdsa-sha2-[a-z0-9-]+)@openssh\.com)\  ]]; then
+  die "public key file $PUBKEY_FILE doesn't look like an OpenSSH public key. First 80 chars:
+  ${PUBKEY_CONTENT:0:80}
+Re-generate with: ssh-keygen -t ed25519 -f $IDENTITY"
+fi
 
 log "Using identity: $IDENTITY"
 log "Target: ${ADMIN_USER}@${HOST}:${SSH_PORT}"
@@ -340,19 +349,35 @@ ssh_admin "${SUDO}env \
 # ---------- 4. install our key for the paperclip user ---------------------
 # This is the lockout-safety prerequisite for the hardening step. We do it
 # *before* harden-server.sh so the key check there always passes.
+#
+# We scp the pubkey to a known temp file on the remote rather than splicing
+# it into a heredoc through `printf '%q'`. That eliminates four layers of
+# quoting (local bash -> ssh arg -> sshd `sh -c` -> sudo -> bash) that
+# previously could collapse to an empty `KEY=`, which then made
+# `grep -qxF "" "$AK"` match every line and silently skip the append.
+log "Uploading public key to remote"
+scp_to "$PUBKEY_FILE" "${ADMIN_USER}@${HOST}:${REMOTE_WORKDIR}/operator.pub"
+
 log "Installing public key for ${PAPERCLIP_USER}@${HOST}"
-ssh_admin "${SUDO}bash -s -- '${PAPERCLIP_USER}'" <<EOF
-set -e
-PU="\$1"
-HOME_DIR="\$(getent passwd "\$PU" | cut -d: -f6)"
-[ -n "\$HOME_DIR" ] && [ -d "\$HOME_DIR" ] || { echo "no home for \$PU" >&2; exit 1; }
-install -d -m 700 -o "\$PU" -g "\$PU" "\$HOME_DIR/.ssh"
-AK="\$HOME_DIR/.ssh/authorized_keys"
-touch "\$AK"
-chown "\$PU:\$PU" "\$AK"
-chmod 600 "\$AK"
-KEY=$(printf '%q' "$PUBKEY_CONTENT")
-grep -qxF "\$KEY" "\$AK" || printf '%s\n' "\$KEY" >> "\$AK"
+ssh_admin "${SUDO}bash -s -- '${PAPERCLIP_USER}' '${REMOTE_WORKDIR}/operator.pub'" <<'EOF'
+set -euo pipefail
+PU="$1"
+KEYFILE="$2"
+[ -s "$KEYFILE" ] || { echo "[fail] $KEYFILE missing or empty on remote" >&2; exit 1; }
+HOME_DIR="$(getent passwd "$PU" | cut -d: -f6)"
+[ -n "$HOME_DIR" ] && [ -d "$HOME_DIR" ] || { echo "[fail] no home for user '$PU'" >&2; exit 1; }
+install -d -m 700 -o "$PU" -g "$PU" "$HOME_DIR/.ssh"
+AK="$HOME_DIR/.ssh/authorized_keys"
+touch "$AK"; chown "$PU:$PU" "$AK"; chmod 600 "$AK"
+KEY="$(cat "$KEYFILE")"
+[ -n "$KEY" ] || { echo "[fail] read empty key from $KEYFILE" >&2; exit 1; }
+grep -qxF "$KEY" "$AK" || printf '%s\n' "$KEY" >> "$AK"
+# Verify the key is actually present after the write.
+if ! grep -qxF "$KEY" "$AK"; then
+  echo "[fail] key not present in $AK after append — $(wc -c < "$AK") bytes, $(wc -l < "$AK") lines" >&2
+  exit 1
+fi
+echo "[ok] $AK now has $(wc -l < "$AK") line(s), $(wc -c < "$AK") bytes"
 EOF
 
 # Verify by actually logging in as the paperclip user with the key.
@@ -371,16 +396,23 @@ if [[ "$RUN_HARDEN" == "1" ]]; then
   # up later), but always allow paperclip.
   if [[ "$ADMIN_USER" != "root" && "$ADMIN_USER" != "$PAPERCLIP_USER" ]]; then
     SSH_USERS_LIST="${PAPERCLIP_USER} ${ADMIN_USER}"
-    # Make sure the admin user also has the key (idempotent).
-    ssh_admin "${SUDO}bash -s -- '${ADMIN_USER}'" <<EOF
-set -e
-PU="\$1"
-HOME_DIR="\$(getent passwd "\$PU" | cut -d: -f6)"
-install -d -m 700 -o "\$PU" -g "\$PU" "\$HOME_DIR/.ssh"
-AK="\$HOME_DIR/.ssh/authorized_keys"
-touch "\$AK"; chown "\$PU:\$PU" "\$AK"; chmod 600 "\$AK"
-KEY=$(printf '%q' "$PUBKEY_CONTENT")
-grep -qxF "\$KEY" "\$AK" || printf '%s\n' "\$KEY" >> "\$AK"
+    # Make sure the admin user also has the key (idempotent). Same scp +
+    # quoted-heredoc approach as the paperclip install above.
+    ssh_admin "${SUDO}bash -s -- '${ADMIN_USER}' '${REMOTE_WORKDIR}/operator.pub'" <<'EOF'
+set -euo pipefail
+PU="$1"
+KEYFILE="$2"
+[ -s "$KEYFILE" ] || { echo "[fail] $KEYFILE missing or empty" >&2; exit 1; }
+HOME_DIR="$(getent passwd "$PU" | cut -d: -f6)"
+[ -n "$HOME_DIR" ] && [ -d "$HOME_DIR" ] || { echo "[fail] no home for '$PU'" >&2; exit 1; }
+install -d -m 700 -o "$PU" -g "$PU" "$HOME_DIR/.ssh"
+AK="$HOME_DIR/.ssh/authorized_keys"
+touch "$AK"; chown "$PU:$PU" "$AK"; chmod 600 "$AK"
+KEY="$(cat "$KEYFILE")"
+[ -n "$KEY" ] || { echo "[fail] empty key in $KEYFILE" >&2; exit 1; }
+grep -qxF "$KEY" "$AK" || printf '%s\n' "$KEY" >> "$AK"
+grep -qxF "$KEY" "$AK" || { echo "[fail] key missing from $AK after append" >&2; exit 1; }
+echo "[ok] $AK now has $(wc -l < "$AK") line(s)"
 EOF
   else
     SSH_USERS_LIST="${PAPERCLIP_USER}"
