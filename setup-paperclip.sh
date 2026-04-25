@@ -196,7 +196,16 @@ npm config set prefix "$HOME/.npm-global"
 
 cat > "$HOME/.paperclip-env" << "EOF"
 # Managed by setup-paperclip.sh — sourced from .bashrc and .profile.
+
+# Drop duplicate entries from $PATH while preserving the first occurrence.
+# Safe to call multiple times. Also exposed as a command for manual cleanup.
+dedupe_path() {
+  PATH="$(printf %s "$PATH" | awk -v RS=: -v ORS=: '\''$0 != "" && !seen[$0]++'\'' | sed '\''s/:$//'\'')"
+  export PATH
+}
+
 export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/.hermes/bin:$HOME/.claude/bin:$HOME/.opencode/bin:$PATH"
+dedupe_path
 EOF
 
 for rc in "$HOME/.bashrc" "$HOME/.profile"; do
