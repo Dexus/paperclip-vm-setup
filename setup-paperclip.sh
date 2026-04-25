@@ -23,6 +23,10 @@
 #       (paperclip/.paperclip-local/). Companion script update-paperclip.sh
 #       safely re-applies the overlay after every `git pull`.
 #    9. (Optional) Writes an nginx reverse-proxy site for port 3100.
+#    9.5 (Optional, SETUP_WIREGUARD=1) Installs a WireGuard server on
+#       wg0 with a generated keypair and provides /usr/local/sbin/add-wg-peer
+#       to mint client configs (with QR code). Reach Paperclip from a peer
+#       at http://<wg-server-ip>/ once the tunnel is up.
 #   10. (Optional) Writes a systemd unit so Paperclip restarts on boot.
 #
 #  Notes / honest caveats:
@@ -55,6 +59,10 @@ NODE_MAJOR="${NODE_MAJOR:-24}"
 GRANT_SUDO="${GRANT_SUDO:-0}"               # 1 = add paperclip to sudo group
 SETUP_NGINX="${SETUP_NGINX:-1}"             # 0 = skip nginx site
 SETUP_SYSTEMD="${SETUP_SYSTEMD:-1}"         # 0 = skip systemd unit
+SETUP_WIREGUARD="${SETUP_WIREGUARD:-0}"     # 1 = install WireGuard server
+WIREGUARD_PORT="${WIREGUARD_PORT:-51820}"   # UDP listen port
+WIREGUARD_NET="${WIREGUARD_NET:-10.7.0.0/24}"
+WIREGUARD_SERVER_IP="${WIREGUARD_SERVER_IP:-10.7.0.1}"
 PAPERCLIP_START_CMD="${PAPERCLIP_START_CMD:-pnpm dev:once}"
 # ---------------------------------------------------------------------------
 
@@ -111,6 +119,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get -y install \
   curl ca-certificates gnupg git build-essential unzip wget \
+  ripgrep silversearcher-ag \
   python3 python3-pip python3-venv \
   nginx
 
@@ -432,6 +441,159 @@ NGINX
   systemctl reload nginx || systemctl restart nginx
 fi
 
+# ---------- 8.5 WireGuard server (optional) --------------------------------
+# When SETUP_WIREGUARD=1, install WireGuard and set up a server interface
+# (wg0) that you can later add peers to via add-wg-peer. Reaching the
+# Paperclip UI from a peer is then just a matter of pointing the browser at
+# http://${WIREGUARD_SERVER_IP}/ once the tunnel is up — nginx already
+# listens on every interface, and harden-server.sh detects wg0 and opens
+# the right firewall rules automatically.
+if [[ "$SETUP_WIREGUARD" == "1" ]]; then
+  log "Installing WireGuard"
+  apt-get -y install wireguard wireguard-tools qrencode
+
+  install -d -m 0700 /etc/wireguard
+  if [[ ! -s /etc/wireguard/server_private.key ]]; then
+    log "Generating WireGuard server keypair"
+    umask 077
+    wg genkey | tee /etc/wireguard/server_private.key \
+              | wg pubkey > /etc/wireguard/server_public.key
+    chmod 600 /etc/wireguard/server_private.key
+    chmod 644 /etc/wireguard/server_public.key
+  fi
+
+  if [[ ! -f /etc/wireguard/wg0.conf ]]; then
+    log "Writing /etc/wireguard/wg0.conf"
+    SERVER_PRIV="$(cat /etc/wireguard/server_private.key)"
+    cat > /etc/wireguard/wg0.conf <<WGEOF
+# Managed by setup-paperclip.sh. Peers are appended by /usr/local/sbin/add-wg-peer.
+# Don't enable SaveConfig — wg-quick would rewrite this file and we'd lose the
+# header / formatting. add-wg-peer keeps things in sync via \`wg syncconf\`.
+[Interface]
+Address    = ${WIREGUARD_SERVER_IP}/${WIREGUARD_NET#*/}
+ListenPort = ${WIREGUARD_PORT}
+PrivateKey = ${SERVER_PRIV}
+WGEOF
+    chmod 600 /etc/wireguard/wg0.conf
+  fi
+
+  log "Writing /usr/local/sbin/add-wg-peer helper"
+  cat > /usr/local/sbin/add-wg-peer <<'PEEREOF'
+#!/usr/bin/env bash
+# add-wg-peer <name> [--full-tunnel]
+#   Generates a WireGuard client keypair + preshared key, allocates the
+#   next free IP in the configured subnet, appends a [Peer] block to
+#   /etc/wireguard/wg0.conf, applies it live with `wg syncconf`, and
+#   writes the client config to /etc/wireguard/clients/<name>.conf.
+#   Prints the client config and a QR code (if qrencode is installed)
+#   ready to scan from the WireGuard mobile app.
+set -euo pipefail
+
+[[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
+
+NAME="${1:-}"
+FULL_TUNNEL=0
+shift || true
+for a in "$@"; do
+  case "$a" in
+    --full-tunnel) FULL_TUNNEL=1 ;;
+    *) echo "unknown flag: $a" >&2; exit 2 ;;
+  esac
+done
+[[ -n "$NAME" ]] || { echo "usage: $0 <name> [--full-tunnel]" >&2; exit 2; }
+[[ "$NAME" =~ ^[a-zA-Z0-9._-]+$ ]] || { echo "name must be [a-zA-Z0-9._-]+" >&2; exit 2; }
+
+CONF=/etc/wireguard/wg0.conf
+[[ -f "$CONF" ]] || { echo "$CONF not found — was setup-paperclip.sh run with SETUP_WIREGUARD=1?" >&2; exit 1; }
+
+CLIENT_DIR=/etc/wireguard/clients
+install -d -m 0700 "$CLIENT_DIR"
+OUT="$CLIENT_DIR/$NAME.conf"
+[[ ! -e "$OUT" ]] || { echo "$OUT already exists — pick a different name or delete it first" >&2; exit 1; }
+
+# --- Parse server settings from wg0.conf ----------------------------------
+SERVER_ADDR="$(awk -F'= *' '/^Address/    {print $2; exit}' "$CONF")"
+SERVER_PORT="$(awk -F'= *' '/^ListenPort/ {print $2; exit}' "$CONF")"
+SERVER_NET="${SERVER_ADDR%/*}"               # e.g. 10.7.0.1
+SERVER_PREFIX="${SERVER_ADDR#*/}"            # e.g. 24
+NET_BASE="${SERVER_NET%.*}"                  # e.g. 10.7.0
+SERVER_PUB="$(cat /etc/wireguard/server_public.key)"
+
+# --- Pick the lowest free IP in the subnet --------------------------------
+USED="$(grep -E '^AllowedIPs' "$CONF" | awk -F'= *' '{print $2}' \
+        | tr ',' '\n' | sed 's|/.*||' | awk -F. '{print $NF}' | sort -nu)"
+USED+=$'\n'"${SERVER_NET##*.}"   # exclude the server itself
+NEXT=""
+for i in $(seq 2 254); do
+  if ! grep -qx "$i" <<<"$USED"; then NEXT="$i"; break; fi
+done
+[[ -n "$NEXT" ]] || { echo "subnet exhausted" >&2; exit 1; }
+PEER_IP="${NET_BASE}.${NEXT}"
+
+# --- Resolve a sensible Endpoint host -------------------------------------
+ENDPOINT_HOST="$(curl -fsS https://api.ipify.org 2>/dev/null \
+              || hostname -I | awk '{print $1}')"
+
+# --- Generate client keypair + PSK ----------------------------------------
+umask 077
+CLIENT_PRIV="$(wg genkey)"
+CLIENT_PUB="$(printf '%s' "$CLIENT_PRIV" | wg pubkey)"
+PSK="$(wg genpsk)"
+
+# --- Append [Peer] block to server config ---------------------------------
+cat >> "$CONF" <<EOF
+
+# peer: $NAME
+[Peer]
+PublicKey    = $CLIENT_PUB
+PresharedKey = $PSK
+AllowedIPs   = ${PEER_IP}/32
+EOF
+
+# --- Apply live without dropping the interface ----------------------------
+if wg show wg0 >/dev/null 2>&1; then
+  wg syncconf wg0 <(wg-quick strip wg0)
+fi
+
+# --- Build + emit client config -------------------------------------------
+if [[ "$FULL_TUNNEL" == "1" ]]; then
+  ALLOWED="0.0.0.0/0, ::/0"
+else
+  ALLOWED="${NET_BASE}.0/${SERVER_PREFIX}"
+fi
+
+cat > "$OUT" <<EOF
+[Interface]
+PrivateKey = $CLIENT_PRIV
+Address    = ${PEER_IP}/32
+DNS        = 1.1.1.1, 9.9.9.9
+
+[Peer]
+PublicKey    = $SERVER_PUB
+PresharedKey = $PSK
+Endpoint     = ${ENDPOINT_HOST}:${SERVER_PORT}
+AllowedIPs   = ${ALLOWED}
+PersistentKeepalive = 25
+EOF
+chmod 600 "$OUT"
+
+echo
+echo "=== client config saved to $OUT ==="
+cat "$OUT"
+if command -v qrencode >/dev/null 2>&1; then
+  echo
+  echo "=== QR (scan with the WireGuard mobile app) ==="
+  qrencode -t ansiutf8 < "$OUT"
+fi
+echo
+echo "Reach the Paperclip UI from this peer at:  http://${SERVER_NET}/"
+PEEREOF
+  chmod 0750 /usr/local/sbin/add-wg-peer
+
+  log "Enabling wg-quick@wg0"
+  systemctl enable --now wg-quick@wg0
+fi
+
 # ---------- 9. systemd unit (optional) -------------------------------------
 if [[ "$SETUP_SYSTEMD" == "1" ]]; then
   log "Writing /etc/systemd/system/paperclip.service"
@@ -492,7 +654,16 @@ Next steps:
 
   4. Hit it:
        http://${PAPERCLIP_DOMAIN/_/<your-server-ip>}/    (via nginx)
-       http://127.0.0.1:${PAPERCLIP_PORT}/               (direct)
+       http://127.0.0.1:${PAPERCLIP_PORT}/               (direct)$( [[ "$SETUP_WIREGUARD" == "1" ]] && printf '\n       http://%s/                          (over WireGuard)' "${WIREGUARD_SERVER_IP}" )
+
+$( [[ "$SETUP_WIREGUARD" == "1" ]] && cat <<WG
+  4b. WireGuard server is running on UDP ${WIREGUARD_PORT}, subnet ${WIREGUARD_NET}.
+      Add a peer (and get a client config + QR code printed):
+        sudo add-wg-peer my-laptop                # split tunnel (default)
+        sudo add-wg-peer phone --full-tunnel      # route everything via VPN
+      Client configs are saved to /etc/wireguard/clients/<name>.conf.
+WG
+)
 
   5. Hermes is wired up as the \`hermes_local\` adapter. In the Paperclip UI,
      create an agent with adapterType "hermes_local" and a model like

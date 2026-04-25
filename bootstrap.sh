@@ -59,6 +59,7 @@ NODE_MAJOR="24"
 RUN_HARDEN=1
 DISABLE_PASSWORDS=1
 GRANT_SUDO=0
+SETUP_WIREGUARD=0
 REMOTE_WORKDIR="/root/paperclip-vm-setup"
 
 usage() {
@@ -76,6 +77,9 @@ Options:
       --domain DOMAIN         nginx server_name (default: catch-all '_')
       --node-major N          Node major to install (default: 24)
       --grant-sudo            Give the paperclip user sudo access
+      --wireguard             Install a WireGuard server (UDP 51820) on the
+                              remote and add /usr/local/sbin/add-wg-peer
+                              for minting client configs
       --no-harden             Skip running harden-server.sh
       --keep-passwords        Leave SSH password auth enabled in hardening
   -h, --help                  Show this help
@@ -101,6 +105,7 @@ while (( $# > 0 )); do
     --domain)              PAPERCLIP_DOMAIN="$2"; shift 2 ;;
     --node-major)          NODE_MAJOR="$2"; shift 2 ;;
     --grant-sudo)          GRANT_SUDO=1; shift ;;
+    --wireguard)           SETUP_WIREGUARD=1; shift ;;
     --no-harden)           RUN_HARDEN=0; shift ;;
     --keep-passwords)      DISABLE_PASSWORDS=0; shift ;;
     -h|--help)             usage; exit 0 ;;
@@ -312,6 +317,7 @@ ssh_admin "${SUDO}env \
   PAPERCLIP_DOMAIN='${PAPERCLIP_DOMAIN}' \
   NODE_MAJOR='${NODE_MAJOR}' \
   GRANT_SUDO='${GRANT_SUDO}' \
+  SETUP_WIREGUARD='${SETUP_WIREGUARD}' \
   bash ${REMOTE_WORKDIR}/setup-paperclip.sh"
 
 # ---------- 4. install our key for the paperclip user ---------------------

@@ -35,6 +35,8 @@
 #    SSH_PORT             port sshd listens on. Default: 22
 #    ALLOW_HTTP           open 80/tcp in UFW (1/0). Default: 1
 #    ALLOW_HTTPS          open 443/tcp in UFW (1/0). Default: 1
+#    WIREGUARD_PORT       UDP port to open for WireGuard. Default: auto-
+#                         detected from /etc/wireguard/wg0.conf if present.
 #    SETUP_FAIL2BAN       install + enable fail2ban (1/0). Default: 1
 #    SETUP_AUTO_UPDATES   enable unattended-upgrades (1/0). Default: 1
 #    HARDEN_KERNEL        write sysctl hardening (1/0). Default: 1
@@ -256,6 +258,23 @@ ufw default allow outgoing
 ufw limit "${SSH_PORT}/tcp" comment 'ssh (rate-limited)'
 [[ "$ALLOW_HTTP"  == "1" ]] && ufw allow 80/tcp  comment 'http'
 [[ "$ALLOW_HTTPS" == "1" ]] && ufw allow 443/tcp comment 'https'
+
+# Auto-detect WireGuard from /etc/wireguard/wg0.conf and open both the
+# UDP listen port (so peers can establish the tunnel) and incoming traffic
+# on the wg0 interface (so peers can reach services like nginx via the
+# tunnel without us punching individual port holes for the WG subnet).
+WG_PORT=""
+if [[ -f /etc/wireguard/wg0.conf ]]; then
+  WG_PORT="$(awk -F'= *' '/^[[:space:]]*ListenPort/ {print $2; exit}' \
+              /etc/wireguard/wg0.conf | tr -d '[:space:]')"
+fi
+WG_PORT="${WIREGUARD_PORT:-$WG_PORT}"
+if [[ -n "$WG_PORT" ]]; then
+  log "Allowing WireGuard UDP/${WG_PORT} and incoming on wg0"
+  ufw allow "${WG_PORT}/udp" comment 'wireguard'
+  ufw allow in on wg0        comment 'wireguard tunnel traffic'
+fi
+
 ufw logging low
 yes | ufw enable >/dev/null
 ufw status verbose || true
