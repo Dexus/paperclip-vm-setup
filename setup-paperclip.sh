@@ -127,9 +127,24 @@ else
   log "Node.js $(node -v) already meets the minimum (>= ${NODE_MAJOR})"
 fi
 
-log "Installing pnpm globally"
-# Paperclip wants pnpm >= 9.15
-npm install -g 'pnpm@>=9.15'
+# Paperclip wants pnpm >= 9.15. Skip the install if a satisfying pnpm is
+# already on PATH — re-running `npm i -g` over an existing binary fails
+# with EEXIST. Use --force on actual upgrades to overwrite the old file.
+PNPM_MIN="9.15.0"
+need_pnpm=1
+if command -v pnpm >/dev/null 2>&1; then
+  cur_pnpm="$(pnpm -v 2>/dev/null || true)"
+  if [[ -n "$cur_pnpm" ]] \
+     && printf '%s\n%s\n' "$PNPM_MIN" "$cur_pnpm" | sort -V -C 2>/dev/null; then
+    need_pnpm=0
+  fi
+fi
+if [[ "$need_pnpm" == "1" ]]; then
+  log "Installing pnpm globally (>= ${PNPM_MIN})"
+  npm install -g --force "pnpm@>=${PNPM_MIN%.*}"
+else
+  log "pnpm $(pnpm -v) already meets the minimum (>= ${PNPM_MIN})"
+fi
 node -v; npm -v; pnpm -v
 
 # ---------- 4. (firewall moved to harden-server.sh) ------------------------
