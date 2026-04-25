@@ -461,4 +461,16 @@ Next steps:
      idempotent overlay (heals the patch if a merge dropped it), rebuilds,
      and restarts the service.
 
+  7. Lock the box down (key-only SSH, UFW, fail2ban, sysctl, auto sec.
+     updates) with the companion hardening script. RUN THIS LAST and only
+     after you have copied an SSH public key for ${PAPERCLIP_USER} (or any
+     other user you intend to log in as) — the script refuses to disable
+     password auth otherwise, but be sure first:
+
+       # On your local machine:
+       ssh-copy-id ${PAPERCLIP_USER}@<this-server>
+
+       # Then on the server:
+       sudo SSH_USERS="${PAPERCLIP_USER}" bash harden-server.sh
+
 DONE
