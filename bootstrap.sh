@@ -163,7 +163,63 @@ done
 
 # ---------- SSH ControlMaster (one TCP connection, many commands) ---------
 CONTROL_DIR="$(mktemp -d -t paperclip-bootstrap.XXXXXX)"
-trap 'ssh -O exit -o ControlPath="$CONTROL_DIR/cm-%C" -p "$SSH_PORT" "${ADMIN_USER}@${HOST}" 2>/dev/null || true; rm -rf "$CONTROL_DIR"' EXIT
+SKIP_CLEANUP=0
+cleanup() {
+  if [[ "$SKIP_CLEANUP" == "1" ]]; then
+    return
+  fi
+  ssh -O exit -o ControlPath="$CONTROL_DIR/cm-%C" -p "$SSH_PORT" \
+      "${ADMIN_USER}@${HOST}" 2>/dev/null || true
+  rm -rf "$CONTROL_DIR"
+}
+trap cleanup EXIT
+
+# ---------- rescue path printer -------------------------------------------
+# Used when something goes wrong AFTER sshd has been touched. The admin
+# ControlMaster session is still authenticated and bypasses sshd's auth
+# (it tunnels new sessions through the existing TCP connection), so it's
+# our escape hatch when key login is broken.
+print_rescue_info() {
+  local rescue_ssh
+  rescue_ssh="ssh -o ControlPath=\"${CONTROL_DIR}/cm-%C\" -i \"${IDENTITY}\" -p ${SSH_PORT} ${ADMIN_USER}@${HOST}"
+  cat >&2 <<RESCUE
+
+$(printf '\033[1;31m')!!! RESCUE SHELL AVAILABLE !!!$(printf '\033[0m')
+
+The admin SSH ControlMaster session is still open and authenticated.
+You can drop into a working shell on ${HOST} WITHOUT re-authenticating
+(this works even if password and/or key auth is currently broken):
+
+    ${rescue_ssh}
+
+This session will live for ~10 minutes (ControlPersist=10m). Keep this
+terminal open — closing it doesn't kill the master, but losing the path
+to ${CONTROL_DIR} does.
+
+Triage commands once you're in:
+
+    ${SUDO}sshd -t                                                  # validate sshd config
+    ${SUDO}cat /etc/ssh/sshd_config.d/99-hardening.conf
+    ${SUDO}journalctl -u ssh --since '5 min ago' --no-pager
+
+Quick rollback of the hardening sshd drop-in:
+
+    ${SUDO}rm /etc/ssh/sshd_config.d/99-hardening.conf
+    ${SUDO}systemctl reload ssh
+
+Re-enable password auth temporarily (lets you reach the box from a
+fresh terminal while you debug keys):
+
+    echo 'PasswordAuthentication yes' | ${SUDO}tee /etc/ssh/sshd_config.d/00-emergency.conf
+    ${SUDO}systemctl reload ssh
+
+Once you have verified login works from a brand-new terminal, close
+the rescue master cleanly with:
+
+    ssh -O exit -o ControlPath="${CONTROL_DIR}/cm-%C" -i "${IDENTITY}" -p ${SSH_PORT} ${ADMIN_USER}@${HOST}
+
+RESCUE
+}
 
 SSH_COMMON=(
   -o "ControlMaster=auto"
@@ -279,7 +335,6 @@ fi
 
 # ---------- 5. run harden-server.sh ---------------------------------------
 if [[ "$RUN_HARDEN" == "1" ]]; then
-  log "Running harden-server.sh on the remote"
   # Allow the admin user too (so you don't lose the bastion if you set one
   # up later), but always allow paperclip.
   if [[ "$ADMIN_USER" != "root" && "$ADMIN_USER" != "$PAPERCLIP_USER" ]]; then
@@ -299,23 +354,42 @@ EOF
     SSH_USERS_LIST="${PAPERCLIP_USER}"
   fi
 
-  ssh_admin "${SUDO}env \
+  log "Running harden-server.sh on the remote"
+  cat <<HEADSUP
+
+\033[1;33mHeads-up: the next step touches sshd.\033[0m If hardening misfires, the
+existing admin SSH session stays open as a rescue shell. Save this
+command somewhere you can paste it from another terminal:
+
+    ssh -o ControlPath="${CONTROL_DIR}/cm-%C" -i "${IDENTITY}" -p ${SSH_PORT} ${ADMIN_USER}@${HOST}
+
+(That path is unique to this run; it's lost if you close this terminal
+without copying it. Full triage instructions are printed on failure.)
+
+HEADSUP
+
+  if ! ssh_admin "${SUDO}env \
     SSH_USERS='${SSH_USERS_LIST}' \
     SSH_PORT='${SSH_PORT}' \
     DISABLE_PASSWORDS='${DISABLE_PASSWORDS}' \
-    bash ${REMOTE_WORKDIR}/harden-server.sh"
+    bash ${REMOTE_WORKDIR}/harden-server.sh"; then
+    SKIP_CLEANUP=1
+    print_rescue_info
+    die "harden-server.sh exited non-zero — see rescue instructions above"
+  fi
 
   # ---------- 6. post-harden verification ---------------------------------
-  # The hardening step reloaded sshd. Re-verify the paperclip key login on
-  # a *fresh* TCP connection (the ControlMaster session is still on the old
-  # daemon).
-  log "Re-verifying key login after sshd reload"
+  # The hardening step reloaded sshd. Re-verify key login on a *fresh* TCP
+  # connection (the ControlMaster is still bound to the old daemon).
+  log "Re-verifying key login on a fresh connection after sshd reload"
   if ! ssh -o BatchMode=yes -o ConnectTimeout=15 \
            -o PreferredAuthentications=publickey \
            -o StrictHostKeyChecking=accept-new \
            -i "$IDENTITY" -p "$SSH_PORT" \
            "${PAPERCLIP_USER}@${HOST}" 'echo ok' >/dev/null 2>&1; then
-    die "key login as ${PAPERCLIP_USER} broke after hardening. The old session is still open; investigate before logging out!"
+    SKIP_CLEANUP=1
+    print_rescue_info
+    die "key login as ${PAPERCLIP_USER} broke after hardening — see rescue instructions above"
   fi
 else
   warn "--no-harden: skipping harden-server.sh. The server is NOT yet locked down."
