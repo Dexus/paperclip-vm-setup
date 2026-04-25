@@ -13,7 +13,7 @@
 #       sudo (Anthropic explicitly recommends against `sudo npm install -g`).
 #    6. Clones github.com/paperclipai/paperclip and runs pnpm install + build.
 #    7. Installs four agent clients into the paperclip user's home:
-#         - Hermes Agent          (~/.hermes/bin/hermes)
+#         - Hermes Agent          (~/.local/bin/hermes via install.sh symlink)
 #         - Claude Code           (~/.claude/bin/claude)
 #         - OpenAI Codex CLI      (~/.npm-global/bin/codex)
 #         - opencode              (~/.opencode/bin/opencode  or  ~/.local/bin)
@@ -359,7 +359,12 @@ fi
 
 # ---------- 7. agent clients (all installed for paperclip user) ------------
 log "Installing Hermes Agent (Nous Research)"
-as_paperclip 'curl -fsSL https://hermes.nousresearch.com/install.sh | bash' \
+# Use the install script from the upstream repo. The hermes.nousresearch.com
+# vanity host returns 503 — the canonical URL is on raw.githubusercontent.com.
+# Lands the `hermes` symlink in ~/.local/bin/hermes (already on PATH).
+# The installer pulls in `uv` if missing and uses that to provision its own
+# Python 3.11+, so the host's system Python doesn't need to match.
+as_paperclip 'curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash' \
   || warn "Hermes installer failed — re-run manually as ${PAPERCLIP_USER}."
 
 log "Installing Claude Code (native installer, Anthropic)"
