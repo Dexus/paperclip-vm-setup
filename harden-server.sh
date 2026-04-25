@@ -35,6 +35,14 @@
 #    SSH_PORT             port sshd listens on. Default: 22
 #    ALLOW_HTTP           open 80/tcp in UFW (1/0). Default: 1
 #    ALLOW_HTTPS          open 443/tcp in UFW (1/0). Default: 1
+#    TRUSTED_IPS          comma-separated list of IPs/CIDRs that are
+#                         (a) allowed to reach the SSH port without going
+#                         through UFW's rate limit, and (b) listed in
+#                         fail2ban's ignoreip so they can never be banned.
+#                         Use this to whitelist your own admin IP and avoid
+#                         locking yourself out. Example:
+#                         TRUSTED_IPS="203.0.113.7,2001:db8::/64"
+#                         Default: "" (no extra whitelist).
 #    WIREGUARD_PORT       UDP port to open for WireGuard. Default: auto-
 #                         detected from /etc/wireguard/wg0.conf if present.
 #    SETUP_FAIL2BAN       install + enable fail2ban (1/0). Default: 1
@@ -56,6 +64,7 @@ SSH_USERS="${SSH_USERS:-paperclip}"
 SSH_PORT="${SSH_PORT:-22}"
 ALLOW_HTTP="${ALLOW_HTTP:-1}"
 ALLOW_HTTPS="${ALLOW_HTTPS:-1}"
+TRUSTED_IPS="${TRUSTED_IPS:-}"
 SETUP_FAIL2BAN="${SETUP_FAIL2BAN:-1}"
 SETUP_AUTO_UPDATES="${SETUP_AUTO_UPDATES:-1}"
 HARDEN_KERNEL="${HARDEN_KERNEL:-1}"
@@ -64,6 +73,25 @@ DISABLE_PASSWORDS="${DISABLE_PASSWORDS:-1}"
 LOCK_ROOT_PASSWORD="${LOCK_ROOT_PASSWORD:-1}"
 FORCE_KEY_ONLY="${FORCE_KEY_ONLY:-0}"
 BANNER_TEXT="${BANNER_TEXT:-}"
+
+# Parse TRUSTED_IPS (comma-separated) into a sanitised array. Strip blanks,
+# skip entries that don't look like an IP/CIDR (very loose check — fail2ban
+# and ufw will reject anything they don't grok anyway). Used by both the UFW
+# section (allow rules placed BEFORE the rate-limit) and fail2ban
+# (ignoreip in the [DEFAULT] section).
+trusted_ips=()
+if [[ -n "$TRUSTED_IPS" ]]; then
+  IFS=',' read -ra _raw_trusted <<< "$TRUSTED_IPS"
+  for _ip in "${_raw_trusted[@]}"; do
+    _ip="${_ip// /}"
+    [[ -z "$_ip" ]] && continue
+    if [[ "$_ip" =~ ^([0-9]{1,3}(\.[0-9]{1,3}){3}|[0-9a-fA-F:]+)(/[0-9]{1,3})?$ ]]; then
+      trusted_ips+=("$_ip")
+    else
+      printf '\033[1;33m[warn]\033[0m TRUSTED_IPS entry %q does not look like an IP/CIDR — skipping\n' "$_ip"
+    fi
+  done
+fi
 
 log()  { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
@@ -200,7 +228,13 @@ PermitEmptyPasswords no
 UsePAM yes
 PubkeyAuthentication yes
 AuthenticationMethods publickey$( [[ "$DISABLE_PASSWORDS" != "1" ]] && echo " password" )
-MaxAuthTries 3
+# 6 == OpenSSH default. Lower values look stricter on paper but bite real
+# operators: ssh-agent often offers many keys, and each offer counts as a
+# "try". With key-only auth this is connection-cost protection, not
+# brute-force protection (an attacker still needs a working private key).
+# Clients can avoid the issue locally with `IdentitiesOnly=yes` + an
+# explicit IdentityFile.
+MaxAuthTries 6
 MaxSessions 5
 LoginGraceTime 30
 $( [[ -n "$allow_users_line" ]] && echo "AllowUsers ${allow_users_line}" )
@@ -257,6 +291,16 @@ log "Configuring UFW (default deny incoming, allow outgoing)"
 ufw --force reset >/dev/null
 ufw default deny incoming
 ufw default allow outgoing
+
+# Whitelist trusted operator IPs FIRST (before the rate-limit rule), so
+# they get unconditional SSH access and don't get throttled when an
+# ssh-agent fans out a lot of key offers in quick succession.
+if (( ${#trusted_ips[@]} > 0 )); then
+  log "Whitelisting trusted IPs on the SSH port: ${trusted_ips[*]}"
+  for ip in "${trusted_ips[@]}"; do
+    ufw allow from "$ip" to any port "${SSH_PORT}" proto tcp comment 'trusted operator'
+  done
+fi
 ufw limit "${SSH_PORT}/tcp" comment 'ssh (rate-limited)'
 [[ "$ALLOW_HTTP"  == "1" ]] && ufw allow 80/tcp  comment 'http'
 [[ "$ALLOW_HTTPS" == "1" ]] && ufw allow 443/tcp comment 'https'
@@ -287,9 +331,15 @@ ufw status verbose || true
 if [[ "$SETUP_FAIL2BAN" == "1" ]]; then
   log "Configuring fail2ban (sshd jail)"
   install -d -m 0755 /etc/fail2ban/jail.d
+  # ignoreip wants space-separated IPs/CIDRs.
+  ignoreip="127.0.0.1/8 ::1"
+  if (( ${#trusted_ips[@]} > 0 )); then
+    ignoreip="${ignoreip} ${trusted_ips[*]}"
+  fi
   cat > /etc/fail2ban/jail.d/paperclip-hardening.local <<F2BEOF
 # Managed by harden-server.sh
 [DEFAULT]
+ignoreip  = ${ignoreip}
 bantime   = 1h
 findtime  = 10m
 maxretry  = 5
@@ -435,6 +485,7 @@ ${C_GREEN}Server hardening applied.${C_RESET}
 Quick checklist:
   - SSH:       port ${SSH_PORT}, key-only=$([[ "$DISABLE_PASSWORDS" == "1" ]] && echo yes || echo NO),
                AllowUsers='${SSH_USERS}'
+  - Trusted:   $( (( ${#trusted_ips[@]} > 0 )) && echo "${trusted_ips[*]}" || echo "(none — fail2ban can ban any source IP)" )
   - Firewall:  ufw active — $(ufw status | sed -n '1p')
   - fail2ban:  $([[ "$SETUP_FAIL2BAN" == "1" ]] && echo enabled || echo skipped)
   - Auto sec.: $([[ "$SETUP_AUTO_UPDATES" == "1" ]] && echo enabled || echo skipped)

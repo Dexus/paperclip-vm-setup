@@ -61,6 +61,12 @@ DISABLE_PASSWORDS=1
 GRANT_SUDO=0
 SETUP_WIREGUARD=0
 REMOTE_WORKDIR="/root/paperclip-vm-setup"
+# Trusted-IP whitelist: passed to harden-server.sh as TRUSTED_IPS so the
+# operator can never lock themselves out via fail2ban / UFW rate-limits.
+# By default we auto-detect the local public IP; --no-trust-ip skips that,
+# --trust-ip <ip> appends extras (repeatable).
+TRUST_LOCAL_IP=1
+EXTRA_TRUST_IPS=()
 
 usage() {
   cat <<USAGE
@@ -82,6 +88,13 @@ Options:
                               for minting client configs
       --no-harden             Skip running harden-server.sh
       --keep-passwords        Leave SSH password auth enabled in hardening
+      --trust-ip IP           Whitelist this IP/CIDR on the SSH port and in
+                              fail2ban (repeatable). By default the local
+                              machine's public IP is auto-detected and
+                              trusted as well, so you don't lock yourself
+                              out the first time you re-connect.
+      --no-trust-ip           Skip the auto-detect of the local public IP.
+                              --trust-ip entries are still honoured.
   -h, --help                  Show this help
 
 Examples:
@@ -110,6 +123,8 @@ while (( $# > 0 )); do
     --wireguard)           SETUP_WIREGUARD=1; shift ;;
     --no-harden)           RUN_HARDEN=0; shift ;;
     --keep-passwords)      DISABLE_PASSWORDS=0; shift ;;
+    --trust-ip)            EXTRA_TRUST_IPS+=("$2"); shift 2 ;;
+    --no-trust-ip)         TRUST_LOCAL_IP=0; shift ;;
     -h|--help)             usage; exit 0 ;;
     --)                    shift; break ;;
     -*)                    die "unknown flag: $1 (use --help)" ;;
@@ -371,6 +386,34 @@ EOF
     SSH_USERS_LIST="${PAPERCLIP_USER}"
   fi
 
+  # Build the trusted-IPs list passed through to harden-server.sh.
+  trust_list=()
+  if [[ "$TRUST_LOCAL_IP" == "1" ]]; then
+    detected=""
+    for url in https://api.ipify.org https://ifconfig.me https://icanhazip.com; do
+      detected="$(curl -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+      if [[ "$detected" =~ ^([0-9]{1,3}(\.[0-9]{1,3}){3}|[0-9a-fA-F:]+)$ ]]; then
+        break
+      fi
+      detected=""
+    done
+    if [[ -n "$detected" ]]; then
+      log "Auto-detected local public IP: ${detected} (will be whitelisted)"
+      trust_list+=("$detected")
+    else
+      warn "Could not auto-detect local public IP — proceeding without an auto-whitelist."
+      warn "If you get locked out, re-run with --trust-ip <your-ip>."
+    fi
+  fi
+  for ip in "${EXTRA_TRUST_IPS[@]}"; do
+    trust_list+=("$ip")
+  done
+  TRUSTED_IPS_CSV=""
+  if (( ${#trust_list[@]} > 0 )); then
+    TRUSTED_IPS_CSV="$(IFS=,; echo "${trust_list[*]}")"
+    log "Trusting these IPs on the SSH port + in fail2ban: ${TRUSTED_IPS_CSV}"
+  fi
+
   log "Running harden-server.sh on the remote"
   cat <<HEADSUP
 
@@ -389,6 +432,7 @@ HEADSUP
     SSH_USERS='${SSH_USERS_LIST}' \
     SSH_PORT='${SSH_PORT}' \
     DISABLE_PASSWORDS='${DISABLE_PASSWORDS}' \
+    TRUSTED_IPS='${TRUSTED_IPS_CSV}' \
     bash ${REMOTE_WORKDIR}/harden-server.sh"; then
     SKIP_CLEANUP=1
     print_rescue_info
