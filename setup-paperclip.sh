@@ -174,7 +174,7 @@ apt-get -y install \
   nano less htop \
   libboost-dev \
   net-tools postgresql-client\
-  python3 python3-pip python3-venv \
+  python3 python3-pip python3-venv pipx \
   nginx
 
 # ---------- 2.5 GitHub CLI (gh) -------------------------------------------
