@@ -242,7 +242,9 @@ $( [[ -n "$allow_users_line" ]] && echo "AllowUsers ${allow_users_line}" )
 # --- Hygiene --------------------------------------------------------------
 X11Forwarding no
 AllowAgentForwarding no
-AllowTcpForwarding no
+# Keep remote forwarding disabled, but allow local forwards for tools such
+# as VS Code Remote SSH that tunnel their server connection over SSH.
+AllowTcpForwarding local
 PermitTunnel no
 PermitUserEnvironment no
 GatewayPorts no
